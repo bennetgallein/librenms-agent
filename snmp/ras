@@ -1,0 +1,373 @@
+#!/usr/bin/env python3
+#
+# Name: RAS Script
+# Author: Bennet Gallein <me@bennetgallein.de>
+# Version: 1.0
+# Description: Reports hardware errors (memory ECC, machine checks, PCIe AER,
+#              block I/O, NIC health) from the EDAC sysfs tree and the
+#              rasdaemon database, for the LibreNMS ras application.
+#              See doc/Extensions/Applications/RAS.md for setup.
+
+import glob
+import json
+import os
+import re
+import shutil
+import sqlite3
+import subprocess
+
+EDAC_ROOT = "/sys/devices/system/edac/mc"
+RAS_DB = "/var/lib/rasdaemon/ras-mc_event.db"
+# BERT records are fixed for the life of a boot, and /run is cleared on reboot.
+BERT_CACHE = "/run/ras-bert.json"
+
+# rasdaemon creates each table on the first event of that type, so a missing
+# table means no events of that class rather than a failure.
+EVENT_TABLES = [
+    "mc_event",
+    "mce_record",
+    "aer_event",
+    "extlog_event",
+    "devlink_event",
+    "disk_errors",
+    "memory_failure_event",
+    "non_standard_event",
+]
+
+
+def run(*args):
+    try:
+        return subprocess.run(args, capture_output=True, text=True, timeout=15).stdout
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def read(path, default=""):
+    try:
+        with open(path) as handle:
+            return handle.read().strip()
+    except OSError:
+        return default
+
+
+def read_int(path):
+    try:
+        return int(read(path, "0"))
+    except ValueError:
+        return 0
+
+
+def read_edac():
+    """Populated DIMMs EDAC exposes, keyed by (controller, channel, slot)."""
+    dimms = {}
+    for mc_path in sorted(glob.glob(os.path.join(EDAC_ROOT, "mc*"))):
+        mc = re.search(r"mc(\d+)$", mc_path)
+        if not mc:
+            continue
+        for path in sorted(glob.glob(os.path.join(mc_path, "dimm*"))):
+            size = read_int(os.path.join(path, "size"))
+            location = re.search(
+                r"channel\s+(\d+)\s+slot\s+(\d+)",
+                read(os.path.join(path, "dimm_location")),
+            )
+            if not size or not location:
+                continue
+            key = (int(mc.group(1)), int(location.group(1)), int(location.group(2)))
+            dimms[key] = {
+                "label": read(os.path.join(path, "dimm_label")),
+                "size_mb": size,
+                "ce": read_int(os.path.join(path, "dimm_ce_count")),
+                "ue": read_int(os.path.join(path, "dimm_ue_count")),
+            }
+    return dimms
+
+
+def read_dmi():
+    """Populated memory devices as (socket, node, channel, slot, locator).
+
+    Read from the kernel's raw SMBIOS tables rather than dmidecode, so there is
+    no external dependency. In a Type 17 structure the size is a word at 0x0c
+    where zero means an empty slot, the Device Locator is a string index at
+    0x10 and the Bank Locator at 0x11. Strings follow the formatted area, NUL
+    separated and indexed from one.
+
+    The Bank Locator holds the firmware's own coordinates (P0_Node0_Channel1_Dimm0)
+    and the Device Locator the name printed on the board (P1-DIMMB1).
+    """
+    slots = []
+    for path in sorted(glob.glob("/sys/firmware/dmi/entries/17-*/raw")):
+        try:
+            with open(path, "rb") as handle:
+                raw = handle.read()
+        except OSError:
+            continue
+        if len(raw) < 2 or raw[0] != 17:
+            continue
+        length = raw[1]
+        if length < 0x12 or len(raw) < length:
+            continue
+        if int.from_bytes(raw[0x0C:0x0E], "little") == 0:
+            continue
+
+        strings = raw[length:].split(b"\x00")
+
+        def string_at(offset, strings=strings, raw=raw):
+            index = raw[offset]
+            if 1 <= index <= len(strings):
+                return strings[index - 1].decode("utf-8", "replace").strip()
+            return ""
+
+        slots.append(_slot(string_at(0x11), string_at(0x10)))
+
+    # Kernels without CONFIG_DMI_SYSFS expose no raw tables, so fall back to
+    # dmidecode where it is installed.
+    if not slots:
+        slots = _read_dmi_dmidecode()
+    return [slot for slot in slots if slot]
+
+
+def _slot(bank, locator):
+    match = re.match(r"P(\d+)_Node(\d+)_Channel(\d+)_Dimm(\d+)$", bank, re.I)
+    return (*(int(g) for g in match.groups()), locator) if match else None
+
+
+def _read_dmi_dmidecode():
+    dmidecode = shutil.which("dmidecode")
+    if not dmidecode:
+        return []
+    slots = []
+    locator = bank = ""
+    populated = False
+    for line in run(dmidecode, "-t", "memory").splitlines():
+        line = line.strip()
+        if line.startswith("Memory Device"):
+            locator = bank = ""
+            populated = False
+        elif line.startswith("Bank Locator:"):
+            bank = line.split(":", 1)[1].strip()
+        elif line.startswith("Locator:"):
+            locator = line.split(":", 1)[1].strip()
+        elif line.startswith("Size:"):
+            populated = not line.split(":", 1)[1].strip().lower().startswith("no ")
+        elif not line and locator:
+            if populated:
+                slots.append(_slot(bank, locator))
+            locator = bank = ""
+            populated = False
+    return slots
+
+
+def map_locators(edac, slots):
+    """Map EDAC coordinates to the DIMM names printed on the board.
+
+    Boards disagree on what the DMI Node field means: on some it is the memory
+    controller, on others the socket, whose channels EDAC then splits across
+    controllers. Both resolve from the data, so no board model is hardcoded.
+
+    Returns {} unless every populated EDAC DIMM maps to one distinct name. A
+    partial match is worse than none, since it could name the wrong DIMM.
+    """
+    if not slots or not edac:
+        return {}
+
+    sockets = {s for s, _, _, _, _ in slots}
+    controllers = {mc for mc, _, _ in edac}
+    if len(controllers) % len(sockets):
+        return {}
+    per_socket = len(controllers) // len(sockets)
+    per_mc = max(channel for _, channel, _ in edac) + 1
+    nodes_per_socket = len({(s, n) for s, n, _, _, _ in slots}) / len(sockets)
+
+    mapping = {}
+    for socket, node, channel, slot, locator in slots:
+        if nodes_per_socket == per_socket:
+            mc, channel = socket * per_socket + node, channel
+        elif nodes_per_socket == 1:
+            mc, channel = socket * per_socket + channel // per_mc, channel % per_mc
+        else:
+            return {}
+        mapping[(mc, channel, slot)] = locator
+
+    names = [mapping.get(key) for key in edac]
+    if None in names or len(set(names)) != len(names):
+        return {}
+    return mapping
+
+
+def _kernel_log():
+    """Kernel ring buffer, preferring journalctl but falling back to dmesg.
+
+    journalctl needs systemd and keeps the log across reboots. dmesg is part of
+    util-linux and works anywhere, though a long-running host may have already
+    overwritten the boot messages.
+    """
+    journalctl = shutil.which("journalctl")
+    if journalctl:
+        out = run(
+            journalctl,
+            "-k",
+            "-b",
+            "0",
+            "-o",
+            "cat",
+            "--no-pager",
+            "-g",
+            "BERT|Hardware Error",
+        )
+        if out:
+            return out
+    dmesg = shutil.which("dmesg")
+    return run(dmesg) if dmesg else ""
+
+
+def rasdaemon_running():
+    """Whether rasdaemon is up, asking systemd first and scanning /proc if absent."""
+    systemctl = shutil.which("systemctl")
+    if systemctl:
+        return int(run(systemctl, "is-active", "rasdaemon").strip() == "active")
+    for path in glob.glob("/proc/[0-9]*/comm"):
+        if read(path) == "rasdaemon":
+            return 1
+    return 0
+
+
+def read_bert():
+    """Firmware record of a fatal error during the previous boot.
+
+    The kernel usually logs nothing when a host dies of a hardware fault, so
+    this is often the only evidence that survives the reset.
+    """
+    try:
+        with open(BERT_CACHE) as handle:
+            return json.load(handle)
+    except (OSError, ValueError):
+        pass
+
+    result = {"bert_fatal": 0, "bert_fru": "", "bert_severity": ""}
+    found = False
+
+    for line in _kernel_log().splitlines():
+        if line.startswith("BERT: Error records from previous boot"):
+            found = True
+        elif not found:
+            continue
+        elif line.startswith("BERT: Total records found"):
+            break
+        severity = re.search(r"event severity:\s*(\S+)", line)
+        if severity:
+            result["bert_severity"] = severity.group(1)
+            result["bert_fatal"] = int(severity.group(1).endswith("fatal"))
+        fru = re.search(r"fru_text:\s*(.+?)\s*$", line)
+        if fru:
+            result["bert_fru"] = fru.group(1)
+
+    try:
+        with open(BERT_CACHE, "w") as handle:
+            json.dump(result, handle)
+    except OSError:
+        pass
+    return result
+
+
+def read_events():
+    """Recorded event counts per class, lifetime and over the last 24 hours."""
+    totals = dict.fromkeys(EVENT_TABLES, 0)
+    recent = dict.fromkeys(EVENT_TABLES, 0)
+    aer = {"aer_ce": 0, "aer_ue": 0}
+
+    if not os.path.exists(RAS_DB) or not os.path.getsize(RAS_DB):
+        return totals, recent, aer
+    try:
+        conn = sqlite3.connect(f"file:{RAS_DB}?mode=ro", uri=True, timeout=5)
+    except sqlite3.Error:
+        return totals, recent, aer
+
+    try:
+        for table in EVENT_TABLES:
+            for target, clause in (
+                (totals, ""),
+                (recent, " WHERE id >= strftime('%s','now','-1 day')"),
+            ):
+                try:
+                    target[table] = conn.execute(
+                        f"SELECT COUNT(*) FROM {table}{clause}"
+                    ).fetchone()[0]
+                except sqlite3.Error:
+                    break
+        # Only uncorrectable PCIe errors mean a device or link is failing.
+        try:
+            for severity, count in conn.execute(
+                "SELECT err_severity, COUNT(*) FROM aer_event GROUP BY err_severity"
+            ):
+                key = "aer_ce" if "corrected" in str(severity).lower() else "aer_ue"
+                aer[key] += count
+        except sqlite3.Error:
+            pass
+    finally:
+        conn.close()
+    return totals, recent, aer
+
+
+def main():
+    edac = read_edac()
+    slots = read_dmi() if edac else []
+    locators = map_locators(edac, slots)
+    dimms = sorted(
+        (
+            {
+                "locator": locators.get(key) or info["label"],
+                "size_mb": info["size_mb"],
+                "ce": info["ce"],
+                "ue": info["ue"],
+            }
+            for key, info in edac.items()
+        ),
+        key=lambda dimm: dimm["locator"],
+    )
+
+    rasdaemon = rasdaemon_running()
+    totals, recent, aer = read_events()
+
+    errors = []
+    if not dimms:
+        errors.append("no EDAC memory controllers found")
+    if not rasdaemon:
+        errors.append("rasdaemon not running")
+
+    data = {
+        "edac_present": int(bool(dimms)),
+        "label_source": "dmi" if locators else "edac",
+        "dimm_count": len(dimms),
+        "dmi_dimm_count": len(slots),
+        "ce_total": sum(dimm["ce"] for dimm in dimms),
+        "ue_total": sum(dimm["ue"] for dimm in dimms),
+        "worst_ce": max((dimm["ce"] for dimm in dimms), default=0),
+        "worst_ue": max((dimm["ue"] for dimm in dimms), default=0),
+        "worst_ce_dimm": "",
+        "worst_ue_dimm": "",
+        "dimms": dimms,
+        "rasdaemon": rasdaemon,
+        "events": totals,
+        "events_24h": recent,
+        **aer,
+        **read_bert(),
+    }
+    for kind in ("ce", "ue"):
+        if data[f"worst_{kind}"]:
+            data[f"worst_{kind}_dimm"] = max(dimms, key=lambda d: d[kind])["locator"]
+
+    print(
+        json.dumps(
+            {
+                "version": 1,
+                "error": int(bool(errors)),
+                "errorString": "; ".join(errors),
+                "data": data,
+            },
+            separators=(",", ":"),
+        )
+    )
+
+
+if __name__ == "__main__":
+    main()
