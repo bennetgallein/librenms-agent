@@ -41,15 +41,6 @@ def pvesh(path, *arguments):
         raise PveError(f"{path} returned invalid json: {error}") from error
 
 
-def ostype(guest):
-    try:
-        config = pvesh(f"/nodes/{guest['node']}/{guest['type']}/{guest['vmid']}/config")
-    except PveError:
-        return ""
-
-    return config.get("ostype", "")
-
-
 def guests(args):
     node = socket.gethostname().split(".")[0]
     vms = []
@@ -71,9 +62,6 @@ def guests(args):
             "mem": int(guest.get("maxmem") or 0),
             "node": guest.get("node"),
         }
-
-        if args.with_os:
-            vm["os"] = ostype(vm)
 
         vms.append(vm)
 
@@ -117,7 +105,6 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--cache", action="store_true", help="write the cache file")
     parser.add_argument("--collect", action="store_true", help="ignore the cache file")
-    parser.add_argument("--with-os", action="store_true", help="read the guest ostype")
     parser.add_argument("--all-nodes", action="store_true", help="report every node")
     parser.add_argument("--templates", action="store_true", help="include templates")
 
