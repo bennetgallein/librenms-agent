@@ -15,58 +15,88 @@
 # See http://www.gnu.org/licenses/gpl.txt for the full license
 
 use strict;
+use JSON::PP;
 use PVE::APIClient::LWP;
 use PVE::AccessControl;
 use PVE::INotify;
-use Data::Dumper;
 
-my $hostname = PVE::INotify::read_file("hostname");
-
-my $ticket = PVE::AccessControl::assemble_ticket('root@pam');
-my $csrftoken = PVE::AccessControl::assemble_csrf_prevention_token('root@pam');
-
-my $conn = PVE::APIClient::LWP->new(
-    ticket => $ticket,
-    csrftoken => $csrftoken,
-);
-
-my $clustername;
-
-foreach my $child (@{$conn->get("/api2/json/cluster/status")}) {
-    if ($child->{'type'} eq "cluster") {
-        $clustername = $child->{'name'};
-    }
-}
-
-if (!defined($clustername)) {
-    $clustername = $hostname;
-}
+my $version = 2;
 
 print "<<<app-proxmox>>>\n";
-print "$clustername\n";
 
-foreach my $vm (@{$conn->get("/api2/json/nodes/$hostname/netstat")}) {
-    my $vmid = $vm->{'vmid'};
-    my $vmname;
+my $data = eval { collect() };
 
-    # Try QEMU (VM)
-    eval {
-        my $config = $conn->get("/api2/json/nodes/$hostname/qemu/$vmid/config");
-        die if defined($config->{'template'}) && $config->{'template'} == 1;
-        $vmname = $config->{'name'};
-    };
+if ($@) {
+    my $error = $@;
+    chomp($error);
+    print "unknown\n";
+    print encode_json({ version => $version, error => 1, errorString => $error, data => {} }) . "\n";
+    exit 0;
+}
 
-    # Try LXC
-    if (!defined $vmname) {
-        eval {
-            my $config = $conn->get("/api2/json/nodes/$hostname/lxc/$vmid/config");
-            die if defined($config->{'template'}) && $config->{'template'} == 1;
-            $vmname = $config->{'hostname'};
+# the cluster name stays on its own line, so a LibreNMS that does not know
+# json reads the cluster and then ignores the rest
+print "$data->{'cluster'}\n";
+print encode_json({ version => $version, error => 0, errorString => '', data => $data }) . "\n";
+exit 0;
+
+sub collect {
+    my $hostname = PVE::INotify::read_file("hostname");
+
+    my $ticket = PVE::AccessControl::assemble_ticket('root@pam');
+    my $csrftoken = PVE::AccessControl::assemble_csrf_prevention_token('root@pam');
+
+    my $conn = PVE::APIClient::LWP->new(
+        ticket => $ticket,
+        csrftoken => $csrftoken,
+    );
+
+    my $clustername;
+
+    foreach my $child (@{$conn->get("/api2/json/cluster/status")}) {
+        if ($child->{'type'} eq "cluster") {
+            $clustername = $child->{'name'};
+        }
+    }
+
+    if (!defined($clustername)) {
+        $clustername = $hostname;
+    }
+
+    my %guests;
+
+    foreach my $guest (@{$conn->get("/api2/json/cluster/resources", { type => 'vm' })}) {
+        next if $guest->{'node'} ne $hostname;
+        next if $guest->{'template'};
+
+        my $vmid = $guest->{'vmid'};
+
+        $guests{$vmid} = {
+            vmid => int($vmid),
+            name => defined($guest->{'name'}) ? $guest->{'name'} : "VMID-$vmid",
+            type => $guest->{'type'},
+            status => $guest->{'status'},
+            cpus => int($guest->{'maxcpu'} || 0),
+            mem => int($guest->{'maxmem'} || 0),
+            ports => [],
         };
     }
 
-    # Default setting
-    $vmname //= "VMID-$vmid";
+    foreach my $port (@{$conn->get("/api2/json/nodes/$hostname/netstat")}) {
+        my $guest = $guests{$port->{'vmid'}};
 
-    print "$vmid/$vm->{'dev'}/$vm->{'in'}/$vm->{'out'}/$vmname\n";
+        next if !defined($guest);
+
+        push @{$guest->{'ports'}}, {
+            dev => $port->{'dev'},
+            in => int($port->{'in'}),
+            out => int($port->{'out'}),
+        };
+    }
+
+    return {
+        cluster => $clustername,
+        node => $hostname,
+        vms => [map { $guests{$_} } sort { $a <=> $b } keys %guests],
+    };
 }
